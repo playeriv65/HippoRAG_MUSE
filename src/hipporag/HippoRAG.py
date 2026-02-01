@@ -46,7 +46,8 @@ class HippoRAG:
                  embedding_model_name=None,
                  embedding_base_url=None,
                  azure_endpoint=None,
-                 azure_embedding_endpoint=None):
+                 azure_embedding_endpoint=None,
+                 openie_mode=None):
         """
         Initializes an instance of the class and its related components.
 
@@ -109,6 +110,9 @@ class HippoRAG:
 
         if azure_embedding_endpoint is not None:
             self.global_config.azure_embedding_endpoint = azure_embedding_endpoint
+
+        if openie_mode is not None:
+             self.global_config.openie_mode = openie_mode
 
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in asdict(self.global_config).items()])
         logger.debug(f"HippoRAG init with config:\n  {_print_config}\n")
@@ -213,7 +217,7 @@ class HippoRAG:
         if self.global_config.save_openie:
             self.save_openie_results(all_openie_info)
 
-        assert False, logger.info('Done with OpenIE, run online indexing for future retrieval.')
+        logger.info('Done with OpenIE batch.')
 
     def index(self, docs: List[str]):
         """
@@ -226,6 +230,7 @@ class HippoRAG:
         """
 
         logger.info(f"Indexing Documents")
+        t0 = time.perf_counter()
 
         logger.info(f"Performing OpenIE")
 
@@ -233,21 +238,31 @@ class HippoRAG:
             self.pre_openie(docs)
 
         self.chunk_embedding_store.insert_strings(docs)
-        chunk_to_rows = self.chunk_embedding_store.get_all_id_to_rows()
+        t_insert = time.perf_counter()
+        
+        # Only process docs provided in this call to index to avoid redundant re-processing of the entire store
+        new_chunk_keys = [compute_mdhash_id(doc, prefix='chunk-') for doc in docs]
+        chunk_to_rows = self.chunk_embedding_store.get_rows(new_chunk_keys)
 
-        all_openie_info, chunk_keys_to_process = self.load_existing_openie(chunk_to_rows.keys())
+        all_openie_info, chunk_keys_to_process = self.load_existing_openie(new_chunk_keys)
         new_openie_rows = {k : chunk_to_rows[k] for k in chunk_keys_to_process}
 
         if len(chunk_keys_to_process) > 0:
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
+        t_openie = time.perf_counter()
 
         if self.global_config.save_openie:
             self.save_openie_results(all_openie_info)
+        t_openie_saved = time.perf_counter()
 
         ner_results_dict, triple_results_dict = reformat_openie_results(all_openie_info)
 
-        assert len(chunk_to_rows) == len(ner_results_dict) == len(triple_results_dict), f"len(chunk_to_rows): {len(chunk_to_rows)}, len(ner_results_dict): {len(ner_results_dict)}, len(triple_results_dict): {len(triple_results_dict)}"
+        # Ensure all chunks in the current batch have been processed successfully
+        for chunk_id in chunk_to_rows.keys():
+            assert chunk_id in ner_results_dict, f"Chunk {chunk_id} missing from NER results"
+            assert chunk_id in triple_results_dict, f"Chunk {chunk_id} missing from Triple extraction results"
+        t_reformat = time.perf_counter()
 
         # prepare data_store
         chunk_ids = list(chunk_to_rows.keys())
@@ -258,9 +273,11 @@ class HippoRAG:
 
         logger.info(f"Encoding Entities")
         self.entity_embedding_store.insert_strings(entity_nodes)
+        t_entity = time.perf_counter()
 
         logger.info(f"Encoding Facts")
         self.fact_embedding_store.insert_strings([str(fact) for fact in facts])
+        t_fact = time.perf_counter()
 
         logger.info(f"Constructing Graph")
 
@@ -276,6 +293,22 @@ class HippoRAG:
 
             self.augment_graph()
             self.save_igraph()
+        t_graph = time.perf_counter()
+
+        logger.info(
+            "[TIMING] hipporag.index docs=%d new=%d insert_s=%.3f openie_s=%.3f save_openie_s=%.3f reformat_s=%.3f "
+            "entity_s=%.3f fact_s=%.3f graph_s=%.3f total_s=%.3f",
+            len(docs),
+            len(chunk_keys_to_process),
+            t_insert - t0,
+            t_openie - t_insert,
+            t_openie_saved - t_openie,
+            t_reformat - t_openie_saved,
+            t_entity - t_reformat,
+            t_fact - t_entity,
+            t_graph - t_fact,
+            t_graph - t0,
+        )
 
     def delete(self, docs_to_delete: List[str]):
         """

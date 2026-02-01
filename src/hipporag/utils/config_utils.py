@@ -36,7 +36,7 @@ class BaseConfig:
         metadata={"help": "Azure Endpoint URI for the OpenAI embedding model, if none, uses OPENAI service directly."}
     )
     max_new_tokens: Union[None, int] = field(
-        default=2048,
+        default=8192,
         metadata={"help": "Max new tokens to generate in each inference."}
     )
     num_gen_choices: int = field(

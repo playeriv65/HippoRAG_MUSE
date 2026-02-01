@@ -1,5 +1,6 @@
 from copy import deepcopy
 from typing import List, Optional
+import os
 
 import numpy as np
 import torch
@@ -31,8 +32,15 @@ class OpenAIEmbeddingModel(BaseEmbeddingModel):
             f"Initializing {self.__class__.__name__}'s embedding model with params: {self.embedding_config.model_init_params}")
 
         if self.global_config.azure_embedding_endpoint is None:
+            # Try to find a specific key for embedding, otherwise fall back to standard env var
+            api_key = os.getenv("OPENAI_API_KEY_EMBEDDING") or os.getenv("OPENAI_API_KEY_OFFICIAL") or os.getenv("OPENAI_API_KEY")
+            
+            # Explicitly force official URL if not provided, to avoid picking up Azure URL from env
+            base_url = self.global_config.embedding_base_url or "https://api.openai.com/v1"
+            
             self.client = OpenAI(
-                base_url=self.global_config.embedding_base_url
+                base_url=base_url,
+                api_key=api_key
             )
         else:
             self.client = AzureOpenAI(api_version=self.global_config.azure_embedding_endpoint.split('api-version=')[1],
@@ -102,8 +110,9 @@ class OpenAIEmbeddingModel(BaseEmbeddingModel):
                 batch = texts[i:i + batch_size]
                 try:
                     results.append(self.encode(batch))
-                except:
-                    import ipdb; ipdb.set_trace()
+                except Exception as e:
+                    logger.error(f"Error encoding batch: {e}")
+                    raise e
                 pbar.update(batch_size)
             pbar.close()
             results = np.concatenate(results)

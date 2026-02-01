@@ -12,7 +12,8 @@ from filelock import FileLock
 from openai import OpenAI
 from openai import AzureOpenAI
 from packaging import version
-from tenacity import retry, stop_after_attempt, wait_fixed
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
 from ..utils.config_utils import BaseConfig
 from ..utils.llm_utils import (
@@ -22,6 +23,11 @@ from ..utils.logging_utils import get_logger
 from .base import BaseLLM, LLMConfig
 
 logger = get_logger(__name__)
+if not logger.handlers:
+    sh = logging.StreamHandler()
+    sh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(sh)
+    logger.setLevel(logging.WARNING)
 
 def cache_response(func):
     @functools.wraps(func)
@@ -36,6 +42,7 @@ def cache_response(func):
 
         # get model, seed and temperature from kwargs or self.llm_config.generate_params
         gen_params = getattr(self, "llm_config", {}).generate_params if hasattr(self, "llm_config") else {}
+
         model = kwargs.get("model", gen_params.get("model"))
         seed = kwargs.get("seed", gen_params.get("seed"))
         temperature = kwargs.get("temperature", gen_params.get("temperature"))
@@ -50,52 +57,43 @@ def cache_response(func):
         key_str = json.dumps(key_data, sort_keys=True, default=str)
         key_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
 
-        # the file name of lock, ensure mutual exclusion when accessing concurrently
-        lock_file = self.cache_file_name + ".lock"
-
         # Try to read from SQLite cache
-        with FileLock(lock_file):
-            conn = sqlite3.connect(self.cache_file_name)
-            c = conn.cursor()
-            # if the table does not exist, create it
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    message TEXT,
-                    metadata TEXT
-                )
-            """)
-            conn.commit()  # commit to save the table creation
-            c.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
-            row = c.fetchone()
-            conn.close()
+        try:
+            with sqlite3.connect(self.cache_file_name, timeout=60.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                c = conn.cursor()
+                c.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
+                row = c.fetchone()
+                
             if row is not None:
                 message, metadata_str = row
                 metadata = json.loads(metadata_str)
-                # return cached result and mark as hit
                 return message, metadata, True
-
+        except sqlite3.OperationalError:
+            pass
+        
         # if cache miss, call the original function to get the result
         result = func(self, *args, **kwargs)
         message, metadata = result
 
-        # insert new result into cache
-        with FileLock(lock_file):
-            conn = sqlite3.connect(self.cache_file_name)
-            c = conn.cursor()
-            # make sure the table exists again (if it doesn't exist, it would be created)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    message TEXT,
-                    metadata TEXT
-                )
-            """)
-            metadata_str = json.dumps(metadata)
-            c.execute("INSERT OR REPLACE INTO cache (key, message, metadata) VALUES (?, ?, ?)",
-                      (key_hash, message, metadata_str))
-            conn.commit()
-            conn.close()
+        # insert new result into cache (rely on SQLite's internal locking and WAL mode)
+        try:
+            with sqlite3.connect(self.cache_file_name, timeout=60.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                c = conn.cursor()
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS cache (
+                        key TEXT PRIMARY KEY,
+                        message TEXT,
+                        metadata TEXT
+                    )
+                """)
+                metadata_str = json.dumps(metadata)
+                c.execute("INSERT OR REPLACE INTO cache (key, message, metadata) VALUES (?, ?, ?)",
+                            (key_hash, message, metadata_str))
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Cache write failed: {e}")
 
         return message, metadata, False
 
@@ -104,8 +102,13 @@ def cache_response(func):
 def dynamic_retry_decorator(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
-        max_retries = getattr(self, "max_retries", 5)  
-        dynamic_retry = retry(stop=stop_after_attempt(max_retries), wait=wait_fixed(1))
+        max_retries = getattr(self, "max_retries", 10)
+        dynamic_retry = retry(
+            stop=stop_after_attempt(max_retries),
+            wait=wait_exponential(multiplier=1, min=1, max=60),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True
+        )
         decorated_func = dynamic_retry(func)
         return decorated_func(self, *args, **kwargs)
     return wrapper
@@ -120,7 +123,7 @@ class CacheOpenAI(BaseLLM):
         return cls(cache_dir=cache_dir, global_config=global_config)
 
     def __init__(self, cache_dir, global_config, cache_filename: str = None,
-                 high_throughput: bool = True,
+                 high_throughput: bool = False,
                  **kwargs) -> None:
 
         super().__init__()
@@ -136,19 +139,39 @@ class CacheOpenAI(BaseLLM):
         self.cache_file_name = os.path.join(self.cache_dir, cache_filename)
 
         self._init_llm_config()
+        if not high_throughput:
+            high_throughput = os.getenv("OPENAI_HIGH_THROUGHPUT", "0") == "1"
         if high_throughput:
             limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
             client = httpx.Client(limits=limits, timeout=httpx.Timeout(5*60, read=5*60))
         else:
             client = None
+            # client = httpx.Client(timeout=httpx.Timeout(30.0, read=30.0)) # shorter timeout for debug
 
         self.max_retries = kwargs.get("max_retries", 2)
 
-        if self.global_config.azure_endpoint is None:
-            self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=self.max_retries)
-        else:
-            self.openai_client = AzureOpenAI(api_version=self.global_config.azure_endpoint.split('api-version=')[1],
-                                             azure_endpoint=self.global_config.azure_endpoint, max_retries=self.max_retries)
+        import threading
+        self._thread_local = threading.local()
+        self._http_client = client
+        self._high_throughput = high_throughput
+
+        # Threading lock for database writes
+        self._cache_lock = threading.Lock()
+        
+        # Initialize database schema once
+        try:
+            with sqlite3.connect(self.cache_file_name, timeout=30.0) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS cache (
+                        key TEXT PRIMARY KEY,
+                        message TEXT,
+                        metadata TEXT
+                    )
+                """)
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to initialize cache database: {e}")
 
     def _init_llm_config(self) -> None:
         config_dict = self.global_config.__dict__
@@ -160,11 +183,22 @@ class CacheOpenAI(BaseLLM):
                 "max_completion_tokens": config_dict.get("max_new_tokens", 400),
                 "n": config_dict.get("num_gen_choices", 1),
                 "seed": config_dict.get("seed", 0),
-                "temperature": config_dict.get("temperature", 0.0),
+                "temperature": 1.0,
             }
 
         self.llm_config = LLMConfig.from_dict(config_dict=config_dict)
         logger.debug(f"Init {self.__class__.__name__}'s llm_config: {self.llm_config}")
+
+    def _get_openai_client(self):
+        client = getattr(self._thread_local, "openai_client", None)
+        if client is None:
+            if self.global_config.azure_endpoint is None:
+                client = OpenAI(base_url=self.llm_base_url, http_client=self._http_client, max_retries=self.max_retries)
+            else:
+                client = AzureOpenAI(api_version=self.global_config.azure_endpoint.split('api-version=')[1],
+                                     azure_endpoint=self.global_config.azure_endpoint, max_retries=self.max_retries)
+            self._thread_local.openai_client = client
+        return client
 
     @cache_response
     @dynamic_retry_decorator
@@ -173,27 +207,64 @@ class CacheOpenAI(BaseLLM):
         messages: List[TextChatMessage],
         **kwargs
     ) -> Tuple[List[TextChatMessage], dict]:
+        import time
+        debug_timing = os.getenv("OPENAI_TIMING", "0") == "1"
+        
+        if debug_timing:
+            print(f"[TIMING] CacheOpenAI.infer start. model={self.llm_config.generate_params.get('model')} msg_len={len(str(messages))}", flush=True)
+        
+        # ... (rest of the code)
+        
         params = deepcopy(self.llm_config.generate_params)
         if kwargs:
             params.update(kwargs)
         params["messages"] = messages
         logger.debug(f"Calling OpenAI GPT API with:\n{params}")
 
-        if 'gpt' not in params['model'] or version.parse(openai.__version__) < version.parse("1.45.0"): # if we use vllm to call openai api or if we use openai but the version is too old to use 'max_completion_tokens' argument
-            # TODO strange version change in openai protocol, but our current vllm version not changed yet
+        if 'gpt' not in params['model'] or version.parse(openai.__version__) < version.parse("1.45.0"): 
+            # if we use vllm to call openai api or if we use openai but the version is too old to use 'max_completion_tokens' argument
             params['max_tokens'] = params.pop('max_completion_tokens')
+        elif 'gpt-5-mini' in params['model'] or 'o1' in params['model'] or 'o3' in params['model']:
+             # Force max_completion_tokens for newer models that don't support max_tokens
+             if 'max_tokens' in params:
+                 params['max_completion_tokens'] = params.pop('max_tokens')
+             # Ensure we don't send max_tokens
+             if 'max_tokens' in params:
+                 del params['max_tokens']
+        
+        # api_start = time.time()
+        # print(f"[TIMING] Starting API call for model {params.get('model')} at {api_start:.2f}")
+        if 'timeout' not in params:
+            params['timeout'] = 300
 
-        response = self.openai_client.chat.completions.create(**params)
+        t0 = time.perf_counter()
+        if debug_timing:
+            print(f"[TIMING] calling openai API... {params.get('model')}", flush=True)
+        response = self._get_openai_client().chat.completions.create(**params)
+        t1 = time.perf_counter()
+        # api_end = time.time()
+        # api_duration = api_end - api_start
+        # print(f"[TIMING] API call completed in {api_duration:.2f}s (prompt_tokens={response.usage.prompt_tokens}, completion_tokens={response.usage.completion_tokens})")
 
         response_message = response.choices[0].message.content
+        if debug_timing:
+            print(f"[TIMING] openai API returned. duration={t1-t0:.3f}s msg_head={str(response_message)[:100]}...", flush=True)
         assert isinstance(response_message, str), "response_message should be a string"
+        
+        # total_duration = time.time() - start_time
         
         metadata = {
             "prompt_tokens": response.usage.prompt_tokens, 
             "completion_tokens": response.usage.completion_tokens,
             "finish_reason": response.choices[0].finish_reason,
+            # "api_duration_seconds": api_duration,
+            # "total_duration_seconds": total_duration,
         }
+        if debug_timing:
+            print(
+                f"[TIMING] openai_call model={params.get('model')} duration_s={t1-t0:.3f} "
+                f"prompt_tokens={metadata.get('prompt_tokens')} completion_tokens={metadata.get('completion_tokens')}",
+                flush=True,
+            )
 
         return response_message, metadata
-
-
